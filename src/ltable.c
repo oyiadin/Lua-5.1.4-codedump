@@ -298,26 +298,28 @@ static void setarrayvector (lua_State *L, Table *t, int size) {
 // 初始化table的hash数组部分
 static void setnodevector (lua_State *L, Table *t, int size) {
   int lsize;
+  // 如果哈希表预期长度为 0，填入一个全局唯一的 dummynode
+  // 借助 dummynode，可以避免空表的特例判断，也可以避免 lsizenode 出现负值（2 ** 0 = 1）
   if (size == 0) {  /* no elements to hash part? */
     t->node = cast(Node *, dummynode);  /* use common `dummynode' */
     lsize = 0;
   }
   else {
     int i;
-    // 为什么这里要计算log2,因为lsizenode就是log2值
     lsize = ceillog2(size);
-    // 过大了!!
     if (lsize > MAXBITS)
       luaG_runerror(L, "table overflow");
-    // 算原始值
     size = twoto(lsize);
-    // 以上的ceillog2和twoto操作将size转换为大于size且为2的次幂的最小的数
-    // 见setarrayvector中注释
+    // 以上几步，先进行 log2，然后再做 pow2
+    // 可以将 size 转换为比 size 大且为 2 的整数次幂中最小的数
+    // 备注：这里的 ceillog2 并不是标准的数学意义上的 log2，做了一点小变换
+
     t->node = luaM_newvector(L, size, Node);
-    // 初始化每个hash成员
+    // 初始化每个哈希表成员
     for (i=0; i<size; i++) {
       Node *n = gnode(t, i);
-      // 将next指针置NULL,将key/value置NIL
+      // Expands to: (&(t)->node[i])
+      // 将当前节点的 next 指针置 NULL, 将 key/value 置 nil
       gnext(n) = NULL;
       setnilvalue(gkey(n));
       setnilvalue(gval(n));
@@ -325,6 +327,7 @@ static void setnodevector (lua_State *L, Table *t, int size) {
   }
   // 存放尺寸和lastfree指针指向最后一个元素
   t->lsizenode = cast_byte(lsize);
+  // lastfree 指针被用于后边哈希表插入的逻辑中，指向最后一个空闲的哈希表节点
   t->lastfree = gnode(t, size);  /* all positions are free */
 }
 
@@ -334,28 +337,25 @@ static void resize (lua_State *L, Table *t, int nasize, int nhsize) {
   int oldasize = t->sizearray;
   int oldhsize = t->lsizenode;
   Node *nold = t->node;  /* save old hash ... */
-  // 如果新的数组部分大于老的数组部分,那么需要扩展数组尺寸
+  // 如果数组发生了扩容，则进行 realloc，并将多出来的部分 set nil
   if (nasize > oldasize)  /* array part must grow? */
     setarrayvector(L, t, nasize);
   /* create new hash part with appropriate size */
   setnodevector(L, t, nhsize);
-  // 如果新的数组部分小于老的数组部分
+  // 如果数组发生了缩容，则遍历少掉的那一部分，插入到哈希表中
   if (nasize < oldasize) {  /* array part must shrink? */
     t->sizearray = nasize;
     /* re-insert elements from vanishing slice */
-    // 遍历多出来的那部分
     for (i=nasize; i<oldasize; i++) {
       // 如果多出来的部分元素不为nil
       if (!ttisnil(&t->array[i]))
-    	// 以i + 1为key, 将i的数据插入hash部分
         setobjt2t(L, luaH_setnum(L, t, i+1), &t->array[i]);
     }
     /* shrink array */
-    // 缩减数组大小
     luaM_reallocvector(L, t->array, oldasize, nasize, TValue);
   }
   /* re-insert elements from hash part */
-  // 为什么从后往前遍历插入呢?
+  // 由于哈希表的长度发生了改变，因此所有数据都需要重新插入一遍
   for (i = twoto(oldhsize) - 1; i >= 0; i--) {
     Node *old = nold+i;
     // 将原来不为nil的元素重新插入hash中
@@ -449,21 +449,23 @@ static Node *getfreepos (Table *t) {
 */
 // 向hash中插入一个新的key
 static TValue *newkey (lua_State *L, Table *t, const TValue *key) {
-  // 根据key寻找在hash中的位置
+  // 计算 key 在哈希表中的对应位置
   Node *mp = mainposition(t, key);
-  // 如果该位置上已经有数据了(!ttisnil(gval(mp)), 或者找不到位置(mp == dummynode)
+  // 如果该位置上已经有数据了，或者哈希表为空
   if (!ttisnil(gval(mp)) || mp == dummynode) {
     Node *othern;
-    // 尝试着获取一个空闲位置
+    // 尝试寻找一个空闲位置
     Node *n = getfreepos(t);  /* get a free place */
-    // 找不到空闲位置?
+    // 找不到空闲位置即进入 rehash 流程
     if (n == NULL) {  /* cannot find a free place? */
       rehash(L, t, key);  /* grow table */
       return luaH_set(L, t, key);  /* re-insert key into grown table */
     }
     lua_assert(n != dummynode);
     othern = mainposition(t, key2tval(mp));
+    // 如果目前占用我们的那个元素，自身也是被其他元素占用了原本该有的位置
     if (othern != mp) {  /* is colliding node out of its main position? */
+      // 那么将占用我们的元素整个挪到 freepos，然后自己鸠占鹊巢
       /* yes; move colliding node into free position */
       while (gnext(othern) != mp) othern = gnext(othern);  /* find previous */
       gnext(othern) = n;  /* redo the chain with `n' in place of `mp' */
@@ -471,7 +473,9 @@ static TValue *newkey (lua_State *L, Table *t, const TValue *key) {
       gnext(mp) = NULL;  /* now `mp' is free */
       setnilvalue(gval(mp));
     }
+    // 如果目前占用我们的那个元素，计算哈希之后本来就应该在当前这个地方
     else {  /* colliding node is in its own main position */
+      // 那么将自己放到 freepos 上，并链到已有元素的后边
       /* new node will go into free position */
       gnext(n) = gnext(mp);  /* chain new position */
       gnext(mp) = n;
@@ -491,11 +495,12 @@ static TValue *newkey (lua_State *L, Table *t, const TValue *key) {
 // 以数字为key的查找函数
 const TValue *luaH_getnum (Table *t, int key) {
   /* (1 <= key && key <= t->sizearray) */
-  // 只要比sizearray小,那么都在数组部分
+  // 只要比 sizearray 小，那么都在数组部分
   if (cast(unsigned int, key-1) < cast(unsigned int, t->sizearray))
     return &t->array[key-1];
+  
+  // 否则在 hash 部分中
   else {
-	// 否则在hash部分中
     lua_Number nk = cast_num(key);
     Node *n = hashnum(t, nk);
     do {  /* check whether `key' is somewhere in the chain */
@@ -538,7 +543,8 @@ const TValue *luaH_get (Table *t, const TValue *key) {
       if (luai_numeq(cast_num(k), nvalue(key))) /* index is int? */
         return luaH_getnum(t, k);  /* use specialized version */
       /* else go through */
-      // 注意前面的不成功,再走近下面的hash部分
+      // 什么情况下会走串这条 case 语句呢
+      // 就是在 key 是数字，但又不是整数的时候，如 table[3.1415] = "chenxy.me"
     }
     default: {
       Node *n = mainposition(t, key);
@@ -625,10 +631,9 @@ static int unbound_search (Table *t, unsigned int j) {
 */
 // 找到第一个"boundary"位置--它本身不为空, 而后一个元素为nil,
 int luaH_getn (Table *t) {
-  // 首先取数组的大小
   unsigned int j = t->sizearray;
   if (j > 0 && ttisnil(&t->array[j - 1])) {
-	// 如果数组的最后一个元素为空
+	  // 如果数组的最后一个元素为 nil，那么在数组中二分查找「最后」一个 nil
     /* there is a boundary in the array part: (binary) search for it */
     unsigned int i = 0;
     while (j - i > 1) {
@@ -638,9 +643,12 @@ int luaH_getn (Table *t) {
     }
     return i;
   }
+  // 如果数组部分的最后一个元素为非 nil……
   /* else must find a boundary in hash part */
   else if (t->node == dummynode)  /* hash part is empty? */
+    // ……而且哈希表是空的，那么非常简单，返回数组大小即可
     return j;  /* that is easy... */
+  // ……否则，在哈希表中（类似）二分查找「最后」一个 nil
   else return unbound_search(t, j);
 }
 

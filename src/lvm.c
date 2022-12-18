@@ -141,13 +141,12 @@ void luaV_settable (lua_State *L, const TValue *t, TValue *key, StkId val) {
   for (loop = 0; loop < MAXTAGLOOP; loop++) {
     const TValue *tm;
     if (ttistable(t)) {  /* `t' is a table? */
-      // 如果t是一个表, 首先获取它的hash部分
+      // 首先获取它的hash部分
       Table *h = hvalue(t);
-      //
       TValue *oldval = luaH_set(L, h, key); /* do a primitive set */
       if (!ttisnil(oldval) ||  /* result is no nil? */
           (tm = fasttm(L, h->metatable, TM_NEWINDEX)) == NULL) { /* or no TM? */
-    	// 替换原来的旧值
+    	  // 替换原来的旧值
         setobj2t(L, oldval, val);
         luaC_barriert(L, h, val);
         return;
@@ -701,8 +700,8 @@ void luaV_execute (lua_State *L, int nexeccalls) {
         continue;
       }
       case OP_SETLIST: {
-        int n = GETARG_B(i);
-        int c = GETARG_C(i);
+        int n = GETARG_B(i);  // to
+        int c = GETARG_C(i);  // from
         int last;
         Table *h;
         if (n == 0) {
@@ -710,6 +709,7 @@ void luaV_execute (lua_State *L, int nexeccalls) {
           L->top = L->ci->top;
         }
         if (c == 0) c = cast_int(*pc++);
+        // 确认 A 是一个 table，取出其中 table 部分的数据
         runtime_check(L, ttistable(ra));
         h = hvalue(ra);
         last = ((c-1)*LFIELDS_PER_FLUSH) + n;
