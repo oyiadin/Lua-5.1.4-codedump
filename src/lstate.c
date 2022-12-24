@@ -39,26 +39,34 @@ typedef struct LG {
   
 
 
+// 此函数目前存在两处调用点，一处是创建主线程的 f_luaopen 函数中，一处是创建新线程的 luaE_newthread 函数中
+// L1 是新的 lua_State，L 是旧的 lua_State
+// 当创建主线程时，两个参数指向的都是同一个 lua_State
 static void stack_init (lua_State *L1, lua_State *L) {
   /* initialize CallInfo array */
-  // 创建CallInfo数组
+  // 初始化 CallInfo 数组
   L1->base_ci = luaM_newvector(L, BASIC_CI_SIZE, CallInfo);
   L1->ci = L1->base_ci;
   L1->size_ci = BASIC_CI_SIZE;
   L1->end_ci = L1->base_ci + L1->size_ci - 1;
   /* initialize stack array */
-  // 创建TValue数组
+  // 初始化堆栈数组
   L1->stack = luaM_newvector(L, BASIC_STACK_SIZE + EXTRA_STACK, TValue);
   L1->stacksize = BASIC_STACK_SIZE + EXTRA_STACK;
   L1->top = L1->stack;
   L1->stack_last = L1->stack+(L1->stacksize - EXTRA_STACK)-1;
   /* initialize first ci */
-  // 没看懂这个下面几句什么意思
+  // 初始化首个 CallInfo
+  // 将 func 指向 L1->top，也就是 L1->stack，也就是栈底首个元素
   L1->ci->func = L1->top;
-  // 这里的作用是把当前top所在区域的值set成nil,然后top++
-  // 在top++之前,从上一句代码可以看出,top指向的位置是L1->ci->func,也就是把L1->ci->func set为nil
+  // 将刚才 func 指向的区域给置为 nil，并自增 top
   setnilvalue(L1->top++);  /* `function' entry for this `ci' */
-  // 执行这句调用之后, base = top = stack + 1, 但是base是存放什么值的呢??
+  // 执行这句调用之后, base = top = stack + 1
+  // 此时栈上的结构
+  //              ???   -+
+  //              ...    |  LUA_MINSTACK (20)
+  // top, base -> ???   -+
+  // ci->func  -> nil
   L1->base = L1->ci->base = L1->top;
   // 这里的意思是,每个lua函数最开始预留LUA_MINSTACK个栈位置,不够的时候再增加,见luaD_checkstack函数
   L1->ci->top = L1->top + LUA_MINSTACK;
@@ -74,6 +82,7 @@ static void freestack (lua_State *L, lua_State *L1) {
 /*
 ** open parts that may cause memory-allocation errors
 */
+// 仅存在一处调用，发生在 lua_newstate 函数中
 static void f_luaopen (lua_State *L, void *ud) {
   global_State *g = G(L);
   UNUSED(ud);
@@ -81,10 +90,13 @@ static void f_luaopen (lua_State *L, void *ud) {
   stack_init(L, L);  /* init stack */
   // 初始化全局表
   sethvalue(L, gt(L), luaH_new(L, 0, 2));  /* table of globals */
-  // 初始化寄存器
+  // 初始化寄存器 TODO
   sethvalue(L, registry(L), luaH_new(L, 0, 2));  /* registry */
+  // 初始化字符串表
   luaS_resize(L, MINSTRTABSIZE);  /* initial size of string table */
+  // 初始化 tag method 名称列表
   luaT_init(L);
+  // 初始化关键字字符串，标记为 reserved
   luaX_init(L);
   // 初始化not enough memory这个字符串并且标记为不可回收
   luaS_fix(luaS_newliteral(L, MEMERRMSG));
@@ -93,7 +105,9 @@ static void f_luaopen (lua_State *L, void *ud) {
 
 
 static void preinit_state (lua_State *L, global_State *g) {
+  // 将 L 里的 l_G 指针置为 g
   G(L) = g;
+  // 主要清空各种与栈相关的字段
   L->stack = NULL;
   L->stacksize = 0;
   L->errorJmp = NULL;
@@ -109,6 +123,7 @@ static void preinit_state (lua_State *L, global_State *g) {
   L->base_ci = L->ci = NULL;
   L->savedpc = NULL;
   L->errfunc = 0;
+  // 清空 global table
   setnilvalue(gt(L));
 }
 
@@ -151,32 +166,48 @@ void luaE_freethread (lua_State *L, lua_State *L1) {
 }
 
 
+// 创建并初始化一个新的 lua_State 对象（以及 global_State 对象）
+// 用于创建主线程时一起创建 lua_State 与 global_State
 LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   int i;
   lua_State *L;
   global_State *g;
+  // 用传入的 lua_Alloc 函数创建一块内存用以放置 lua_State 跟 global_State
+  // state_size 展开来是 (sizeof(LG) + LUAI_EXTRASPACE)
+  // LG 是一个仅包含了 lua_State 跟 global_State 的结构体
+  // LUAI_EXTRASPACE 是一个用户可以指定的常量，默认为 0，作用是定制 Lua 解释器时可以借助这个宏在 lua_State 里扩充自己的字段
   void *l = (*f)(ud, NULL, 0, state_size(LG));
+  // 这里创建出来是 lua_State + global_State + LUAI_EXTRASPACE(默认为0) 的大小
+  // 当另开新线程时，使用的是 lua_newthread，仅创建 lua_State，与已有的线程共享 global_State
   if (l == NULL) return NULL;
   L = tostate(l);
   g = &((LG *)L)->g;
+  // 清空、初始化 L 跟 g 的各种字段
+  // GC 部分，标记为白色，等后边研究 GC 再讨论
   L->next = NULL;
   L->tt = LUA_TTHREAD;
   g->currentwhite = bit2mask(WHITE0BIT, FIXEDBIT);
   L->marked = luaC_white(g);
+  // 标记刚创建的 lua_State 对象为不可回收
   set2bits(L->marked, FIXEDBIT, SFIXEDBIT);
+  // 主要初始化一些栈相关的字段
   preinit_state(L, g);
   g->frealloc = f;
   g->ud = ud;
+  // 全局状态结构体里，主线程置为当前 lua_State
   g->mainthread = L;
   g->uvhead.u.l.prev = &g->uvhead;
   g->uvhead.u.l.next = &g->uvhead;
   g->GCthreshold = 0;  /* mark it as unfinished state */
+  // 全局字符串表，Lua 里的字符串都是「内化」（interned）的
+  // 所有相同取值的字符串有且仅有一个实例，被记录在 strt 全局字符串表中
   g->strt.size = 0;
   g->strt.nuse = 0;
   g->strt.hash = NULL;
   setnilvalue(registry(L));
   luaZ_initbuffer(L, &g->buff);
   g->panic = NULL;
+  // GC 相关的字段
   g->gcstate = GCSpause;
   g->rootgc = obj2gco(L);
   g->sweepstrgc = 0;
@@ -189,6 +220,8 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   g->gcpause = LUAI_GCPAUSE;
   g->gcstepmul = LUAI_GCMUL;
   g->gcdept = 0;
+  // 清空全局元表
+  // g->mt 的元素与各个类型一一对应，如 LUA_TNUMBER、LUA_TSTRING 等
   for (i=0; i<NUM_TAGS; i++) g->mt[i] = NULL;
   if (luaD_rawrunprotected(L, f_luaopen, NULL) != 0) {
     /* memory allocation error: free partial state */

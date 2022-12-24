@@ -27,6 +27,7 @@ const char *const luaT_typenames[] = {
 };
 
 
+// 初始化 G->tmname 数组
 void luaT_init (lua_State *L) {
   static const char *const luaT_eventname[] = {  /* ORDER TM */
     "__index", "__newindex",

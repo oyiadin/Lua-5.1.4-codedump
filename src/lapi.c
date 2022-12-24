@@ -826,7 +826,10 @@ LUA_API int lua_pcall (lua_State *L, int nargs, int nresults, int errfunc) {
   int status;
   ptrdiff_t func;
   lua_lock(L);
+  // 检查栈顶到栈底的空间大小，至少要能容纳 nargs(参数数量) + 1(函数指针)
   api_checknelems(L, nargs+1);
+  // Expands to: api_check(L, (nresults) == LUA_MULTRET || (L->ci->top - L->top >= (nresults) - (nargs)))
+  // 要么传入特殊值 LUA_MULTRET，要么当前 ci 的栈预留好足够放置 nresults 的空间
   checkresults(L, nargs, nresults);
   if (errfunc == 0)
     func = 0;
@@ -835,6 +838,12 @@ LUA_API int lua_pcall (lua_State *L, int nargs, int nresults, int errfunc) {
     api_checkvalidindex(L, o);
     func = savestack(L, o);
   }
+  // 目前栈上空间长这样：
+  // top   -> ???     [high]
+  //          arg       |
+  //          func      |
+  // base  -> ???     [low]
+  // c.func 指向将要执行的函数
   c.func = L->top - (nargs+1);  /* function to be called */
   c.nresults = nresults;
   status = luaD_pcall(L, f_call, &c, savestack(L, c.func), func);

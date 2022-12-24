@@ -272,17 +272,18 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
   ptrdiff_t funcr;
   if (!ttisfunction(func)) /* `func' is not a function? */
     func = tryfuncTM(L, func);  /* check the `function' tag method */
-  // 首先计算函数指针距离stack的偏移量
+  // 函数指针距离 stack 的偏移量
   funcr = savestack(L, func);
-  // 获取closure指针
   cl = &clvalue(func)->l;
-  // 保存PC
+  // 保存旧的 pc 到当前 ci
   L->ci->savedpc = L->savedpc;
+  // Lua 函数的分支
   if (!cl->isC) {  /* Lua function? prepare its call */
     CallInfo *ci;
     StkId st, base;
     Proto *p = cl->p;
     luaD_checkstack(L, p->maxstacksize);
+    // 根据 funcr，也就是 func 距离 stack 的偏移量，恢复出 func 指针
     func = restorestack(L, funcr);
     if (!p->is_vararg) {  /* no varargs? */
       base = func + 1;
@@ -294,17 +295,18 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
       base = adjust_varargs(L, p, nargs);
       func = restorestack(L, funcr);  /* previous call may change the stack */
     }
-    // 存放新的函数信息
-    // 首先从callinfo数组中分配出一个新的callinfo
+    // 存放新的 CallInfo 信息
+    // 自增 L->ci。如若需要，会执行 growCI(L)
     ci = inc_ci(L);  /* now `enter' new function */
     ci->func = func;
     L->base = ci->base = base;
     ci->top = L->base + p->maxstacksize;
     lua_assert(ci->top <= L->stack_last);
-    // 改变代码执行的路径
+    // 将 pc 指向解析出来的 Proto->code，也就是 opcode 数组
     L->savedpc = p->code;  /* starting point */
     ci->tailcalls = 0;
     ci->nresults = nresults;
+    // 清空栈上数据
     for (st = L->top; st < ci->top; st++)
       setnilvalue(st);
     L->top = ci->top;
@@ -314,6 +316,14 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
       L->savedpc--;  /* correct 'pc' */
     }
     return PCRLUA;
+    // 经过这一番处理之后，各个字段的指向如下所示：
+    // newci->top = L->top ->   nil     --+
+    //                          ...       |  p->maxstacksize
+    // (previous) L->top ->     nil       |
+    //                          arg     --+
+    //                          ...       |  p->numparams
+    // newci->base = L->base -> arg     --+
+    // newci->func ->           closure
   }
   else {  /* if is a C function, call it */
     CallInfo *ci;
@@ -390,11 +400,13 @@ int luaD_poscall (lua_State *L, StkId firstResult) {
 ** function position.
 */ 
 void luaD_call (lua_State *L, StkId func, int nResults) {
-  // 函数调用栈数量+1, 判断函数调用栈是不是过长
+  // 函数调用栈数量 +1，并判断函数调用栈是不是过长
   if (++L->nCcalls >= LUAI_MAXCCALLS) {
     if (L->nCcalls == LUAI_MAXCCALLS)
+      // 爆栈了，进入错误处理流程
       luaG_runerror(L, "C stack overflow");
     else if (L->nCcalls >= (LUAI_MAXCCALLS + (LUAI_MAXCCALLS>>3)))
+      // 爆栈之后，错误处理过程中又爆了
       luaD_throw(L, LUA_ERRERR);  /* error while handing stack error */
   }
   if (luaD_precall(L, func, nResults) == PCRLUA)  /* is a Lua function? */

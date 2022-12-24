@@ -105,6 +105,7 @@ typedef struct global_State {
 ** `per thread' state
 */
 struct lua_State {
+  // lua_State 也纳入了 GC 的管理
   CommonHeader;
   lu_byte status;
   StkId top;  /* first free slot in the stack */
