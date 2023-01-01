@@ -282,13 +282,18 @@ int luaV_equalval (lua_State *L, const TValue *t1, const TValue *t2) {
 }
 
 
+// 将以 last 寄存器结尾的 total 个对象，合并到一起，最终结果放置在范围内首个寄存器里
 void luaV_concat (lua_State *L, int total, int last) {
   do {
     StkId top = L->base + last + 1;
+    // 一次处理两个元素
+    // （给下边前两个分支作为默认值，第三个分支其实是一次性把所有字符串都给合并了，里边会覆盖 n 的取值）
     int n = 2;  /* number of elements handled in this pass (at least 2) */
+    // 如果三个条件都不满足，可能是一些奇奇怪怪的类型，直接用元表处理
     if (!(ttisstring(top-2) || ttisnumber(top-2)) || !tostring(L, top-1)) {
       if (!call_binTM(L, top-2, top-1, top-2, TM_CONCAT))
         luaG_concaterror(L, top-2, top-1);
+    // 如果当前最后一个元素为空字符串，直接将倒数第二个元素转为字符串作为此轮的结果
     } else if (tsvalue(top-1)->len == 0)  /* second op is empty? */
       (void)tostring(L, top - 2);  /* result is first op (as string) */
     else {
@@ -297,23 +302,30 @@ void luaV_concat (lua_State *L, int total, int last) {
       char *buffer;
       int i;
       /* collect total length */
+      // 从后往前遍历，计算出范围内所有元素（字符串）的长度总和
       for (n = 1; n < total && tostring(L, top-n-1); n++) {
         size_t l = tsvalue(top-n-1)->len;
+        // 长度超限报错
         if (l >= MAX_SIZET - tl) luaG_runerror(L, "string length overflow");
         tl += l;
       }
+      // 分配一块 tl 长度的内存
       buffer = luaZ_openspace(L, &G(L)->buff, tl);
       tl = 0;
       for (i=n; i>0; i--) {  /* concat all strings */
         size_t l = tsvalue(top-i)->len;
+        // 将所有字符串从前往后依次拼接到 buffer 中
         memcpy(buffer+tl, svalue(top-i), l);
         tl += l;
       }
+      // 利用 luaS_newlstr 函数创建一个 TString 对象（存入全局字符串表中），并放入第一个字符串对应的寄存器中
+      // 详见我的另外一篇解析 Lua 字符串的文章
       setsvalue2s(L, top-n, luaS_newlstr(L, buffer, tl));
     }
     total -= n-1;  /* got `n' strings to create 1 new */
     last -= n-1;
   } while (total > 1);  /* repeat until only 1 result left */
+  // 循环的退出条件是只剩一个对象未处理（也就是最终存放结果的那个对象）
 }
 
 
@@ -384,12 +396,20 @@ void luaV_execute (lua_State *L, int nexeccalls) {
   const Instruction *pc;
  reentry:  /* entry point */
   lua_assert(isLua(L->ci));
+  // 当前指令
+  // 这个 L->savedpc 在 luaD_precall 中已设置为 p->code，也就是语法解析获得的指令序列，如下：
+  //    // 将 pc 指向解析出来的 Proto->code，也就是 opcode 数组
+  //    L->savedpc = p->code;  /* starting point */
   pc = L->savedpc;
+  // 当前 CallInfo 对应的闭包
   cl = &clvalue(L->ci->func)->l;
+  // 栈基
   base = L->base;
+  // 常量表，注意到此表随着 closure 一起管理
   k = cl->p->k;
   /* main loop of interpreter */
   for (;;) {
+    // 取指令并自增
     const Instruction i = *pc++;
     StkId ra;
     if ((L->hookmask & (LUA_MASKLINE | LUA_MASKCOUNT)) &&
@@ -657,34 +677,51 @@ void luaV_execute (lua_State *L, int nexeccalls) {
         }
       }
       case OP_FORLOOP: {
+        // ra + 0: 初始值（被减过一次步长），循环期间作为计数值使用
+        // ra + 1: 极限值（上限/下限）
+        // ra + 2: 步长
         lua_Number step = nvalue(ra+2);
+        // 先加步长
+        // 在第一次循环时抵消掉了 OP_FORPREP 中那次多余的减步长操作
+        // 在后续循环中就是正常的循环步增操作了
         lua_Number idx = luai_numadd(nvalue(ra), step); /* increment index */
         lua_Number limit = nvalue(ra+1);
+        // 根据步长的正负值来决定条件判断的方向，判断是否已超过了极限值（上限/下限）
         if (luai_numlt(0, step) ? luai_numle(idx, limit)
                                 : luai_numle(limit, idx)) {
+          // 如果还没超过极限值……
+          // 那么往回跳，执行夹在 OP_FORPREP 与 OP_LOOP 之间的循环体
           dojump(L, pc, GETARG_sBx(i));  /* jump back */
+          // 更新 ra + 0、ra + 3 这两个计数值
+          // 前者供 OP_FORLOOP 这套逻辑使用，后者供循环体使用
           setnvalue(ra, idx);  /* update internal index... */
           setnvalue(ra+3, idx);  /* ...and external index */
         }
+        // 如果已超过极限值，不做任何特殊处理，直接正常执行下一条指令即可
         continue;
       }
       case OP_FORPREP: {
-        const TValue *init = ra;
-        const TValue *plimit = ra+1;
-        const TValue *pstep = ra+2;
+        const TValue *init = ra;      // 初始值
+        const TValue *plimit = ra+1;  // 极限值（上限/下限）
+        const TValue *pstep = ra+2;   // 步长
         L->savedpc = pc;  /* next steps may throw errors */
+        // 检查 init, plimit, pstep 三个参数都能转换为数字，并将转换后的结果放在原位置
         if (!tonumber(init, ra))
           luaG_runerror(L, LUA_QL("for") " initial value must be a number");
         else if (!tonumber(plimit, ra+1))
           luaG_runerror(L, LUA_QL("for") " limit must be a number");
         else if (!tonumber(pstep, ra+2))
           luaG_runerror(L, LUA_QL("for") " step must be a number");
+        // 先让初始值减去步长，然后根据 sBx 执行跳转（会跳转到 OP_FORLOOP 指令，在其中加上步长，抵消了这一次额外的计算）
+        // 这里减完仍然放在 ra + 0 的地方
         setnvalue(ra, luai_numsub(nvalue(ra), nvalue(pstep)));
         dojump(L, pc, GETARG_sBx(i));
         continue;
       }
       case OP_TFORLOOP: {
+        // cb = ra + 3 是所谓「call base」
         StkId cb = ra + 3;  /* call base */
+        // 将 [ra, ra+3) 范围内的寄存器值，依次搬运到 [cb, cb+3) 中，也就是 [ra+3, ra+6)
         setobjs2s(L, cb+2, ra+2);
         setobjs2s(L, cb+1, ra+1);
         setobjs2s(L, cb, ra);
