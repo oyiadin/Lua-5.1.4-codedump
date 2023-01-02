@@ -607,18 +607,32 @@ void luaV_execute (lua_State *L, int nexeccalls) {
         continue;
       }
       case OP_CALL: {
+        // 参数 B 的含义：
+        // =0: [ra, L->top) 的范围内都是参数
+        // >0: (B-1) 为参数个数
         int b = GETARG_B(i);
+        // 参数 C 的含义：
+        // (C-1) 为返回值个数
+        // 所以大多数场景下，C 的典型取值是 2
         int nresults = GETARG_C(i) - 1;
-        // 如果传入参数数量不为0, 则这是top地址,由它开始后面紧跟着都是函数参数
+        // 如果参数 B 不是 0，需要调整 top 指针
+        // 后续是通过 top 指针来识别参数的
         if (b != 0) L->top = ra+b;  /* else previous instruction set top */
-        // 保存当前pc
+        // 保存当前 pc，这个 pc 在后边 luaD_precall 会被赋值给 L->ci->savedpc
+        // 最终在 OP_RETURN 里被用来作为函数退出后跳回的目标地址（指令）
         L->savedpc = pc;
         switch (luaD_precall(L, ra, nresults)) {
           case PCRLUA: {
+            // 自增调用栈深度计数器
             nexeccalls++;
+            // 如果 ra 这个 closure 是个 Lua 函数，L->savedpc 会被修改为该函数的 proto->code
+            // 因此跳回 reentry 之后，重新取的指令就已经是目标函数的了
+            // 直到遇到 OP_RETURN 之后，再重新恢复为现有状态，继续被中断执行的“父函数”
             goto reentry;  /* restart luaV_execute over new Lua function */
           }
           case PCRC: {
+            // 如果是 C 函数，那么在 luaD_precall 里已经完成调用了
+            // 只需要微调一下栈上结构即可，把 top 跟 base 指针恢复一下
             /* it was a C function (`precall' called it); adjust results */
             if (nresults >= 0) L->top = L->ci->top;
             base = L->base;
@@ -631,11 +645,16 @@ void luaV_execute (lua_State *L, int nexeccalls) {
       }
       case OP_TAILCALL: {
         int b = GETARG_B(i);
+        // B 参数的含义与 OP_CALL 一致
         if (b != 0) L->top = ra+b;  /* else previous instruction set top */
         L->savedpc = pc;
         lua_assert(GETARG_C(i) - 1 == LUA_MULTRET);
+        // LUA_MULTIRET 在 OP_RETURN 中会用到
         switch (luaD_precall(L, ra, LUA_MULTRET)) {
           case PCRLUA: {
+            // 如果是 Lua 函数，在 luaD_precall 中已经创建了新 ci
+            // 因此此时 L->ci 是新 ci，而 L->ci - 1 则是触发尾调用的这个即将结束的函数的 ci
+            // 主要就是把新 ci 的东西搬到调用者的 ci 里，进行偷梁换柱
             /* tail call: put new frame in place of previous one */
             CallInfo *ci = L->ci - 1;  /* previous frame */
             int aux;
@@ -643,16 +662,20 @@ void luaV_execute (lua_State *L, int nexeccalls) {
             StkId pfunc = (ci+1)->func;  /* previous function index */
             if (L->openupval) luaF_close(L, ci->base);
             L->base = ci->base = ci->func + ((ci+1)->base - pfunc);
+            // 将参数一一挪过去
             for (aux = 0; pfunc+aux < L->top; aux++)  /* move frame down */
               setobjs2s(L, func+aux, pfunc+aux);
+            // 调整被替代的 ci 里几个重要的指针，top、savedpc 等，base 指针在上边调整过了
             ci->top = L->top = func+aux;  /* correct top */
             lua_assert(L->top == L->base + clvalue(func)->l.p->maxstacksize);
             ci->savedpc = L->savedpc;
             ci->tailcalls++;  /* one more call lost */
+            // 「删除」在 luaD_precall 里创建的新 ci
             L->ci--;  /* remove new frame */
             goto reentry;
           }
           case PCRC: {  /* it was a C function (`precall' called it) */
+            // 对于 C 函数而言，还是一样没有太多需要做的事情
             base = L->base;
             continue;
           }
@@ -663,12 +686,21 @@ void luaV_execute (lua_State *L, int nexeccalls) {
       }
       case OP_RETURN: {
         int b = GETARG_B(i);
+        // 参数 B 的含义与 OP_CALL 一致 (0代表到top为止都是返回值，>0代表b-1是返回值数量)
         if (b != 0) L->top = ra+b-1;
+        // 如果有 upvals，需要关闭
         if (L->openupval) luaF_close(L, base);
         L->savedpc = pc;
         b = luaD_poscall(L, ra);
+        // nexeccalls 是外部传入的参数，典型值是 1，在载入 Lua 脚本之后，函数 luaD_call 中发起调用
+        // 每当遇到 OP_CALL(而且得是 Lua 函数) 就会 +1，遇到 OP_RETURN 时就会 -1
+        // 当最外层函数也完成执行，进入 OP_RETURN 时，这里就会算出 0 值，因此直接让 luaV_execute 退出
         if (--nexeccalls == 0)  /* was previous function running `here'? */
           return;  /* no: return */
+        // 而存在函数调用时，nexeccalls 自减完依然非 0
+        // 这种情况下，其实是走了 OP_CALL 指令 goto reentry 的逻辑，从 C 调用栈的角度来看，这一次的 luaV_execute 还没退出呢
+        // 所以为了恢复到上一次函数调用时刻的状态，也不应该 return 结束掉这一次的 luaV_execute 调用
+        // 由于 luaD_poscall 已经做完了相关工作，所以只需要再简单地把 L->top 指针恢复一下即可
         else {  /* yes: continue its execution */
           if (b) L->top = L->ci->top;
           lua_assert(isLua(L->ci));

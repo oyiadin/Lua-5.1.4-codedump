@@ -267,6 +267,9 @@ static StkId tryfuncTM (lua_State *L, StkId func) {
    (condhardstacktests(luaD_reallocCI(L, L->size_ci)), ++L->ci))
 
 // 函数调用的预处理, func是函数closure所在位置, nresults是返回值数量
+// 如果是 Lua 函数，会创建新的 ci，调整栈上结构、覆盖 L->savedpc 为新函数的 proto->code 等。
+// 退出此函数后会进入(或跳到开头执行)luaV_execute，此时执行的 L->savedpc 就已经是新函数的指令了
+// 如果是 C 函数，也会创建新的 ci，并在此基础上直接调用该 C 函数，然后借助 luaD_poscall 完成函数结束后的一些调整
 int luaD_precall (lua_State *L, StkId func, int nresults) {
   LClosure *cl;
   ptrdiff_t funcr;
@@ -275,7 +278,8 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
   // 函数指针距离 stack 的偏移量
   funcr = savestack(L, func);
   cl = &clvalue(func)->l;
-  // 保存旧的 pc 到当前 ci
+  // 保存旧的 pc 到当前 ci（即将成为「上一个 ci」）
+  // 用以在 OP_RETURN 中确认返回的目标地址（指令）
   L->ci->savedpc = L->savedpc;
   // Lua 函数的分支
   if (!cl->isC) {  /* Lua function? prepare its call */
@@ -286,6 +290,7 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
     // 根据 funcr，也就是 func 距离 stack 的偏移量，恢复出 func 指针
     func = restorestack(L, funcr);
     if (!p->is_vararg) {  /* no varargs? */
+      // base 设定为 func + 1，也就是第一个参数（若有）的位置
       base = func + 1;
       if (L->top > base + p->numparams)
         L->top = base + p->numparams;
@@ -296,19 +301,24 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
       func = restorestack(L, funcr);  /* previous call may change the stack */
     }
     // 存放新的 CallInfo 信息
-    // 自增 L->ci。如若需要，会执行 growCI(L)
+    // 自增 L->ci，将指向 CallInfo 数组里的下一项。如若需要，会执行 growCI(L)
     ci = inc_ci(L);  /* now `enter' new function */
     ci->func = func;
     L->base = ci->base = base;
+    // ci->top 先默认预留出 p->maxstacksize 的空间
     ci->top = L->base + p->maxstacksize;
     lua_assert(ci->top <= L->stack_last);
     // 将 pc 指向解析出来的 Proto->code，也就是 opcode 数组
+    // 退出此函数之后，会进入/跳转到头部 luaV_execute，重新取得的指令序列就是此处设置的 proto->code，因此就成功进入新函数的执行循环了
     L->savedpc = p->code;  /* starting point */
     ci->tailcalls = 0;
     ci->nresults = nresults;
-    // 清空栈上数据
+    // 清空从最后一个入参到 maxstacksize 之间的栈上数据
     for (st = L->top; st < ci->top; st++)
       setnilvalue(st);
+    // L->top 之前标识着参数数量，现在直接给覆盖了，也不见有哪处做了备份
+    // 说明被调用的函数其实不真的关心 L->top 的旧有取值，应该早在生成 opcode 的时候就已经做了约定
+    // 函数调用的流程应当是调用者与被调用者共同遵守规范（就如这个参数数量的约定）而完成的
     L->top = ci->top;
     if (L->hookmask & LUA_MASKCALL) {
       L->savedpc++;  /* hooks assume 'pc' is already incremented */
@@ -326,13 +336,15 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
     // newci->func ->           closure
   }
   else {  /* if is a C function, call it */
+    // 如果是 C 函数，也同样会为其创建一个新的 ci
     CallInfo *ci;
     int n;
     luaD_checkstack(L, LUA_MINSTACK);  /* ensure minimum stack size */
     // 从CallInfo数组中返回一个CallInfo指针
     ci = inc_ci(L);  /* now `enter' new function */
-    // 根据之前保存的偏移量从栈中得到函数地址
+    // 根据之前保存的 funcr 偏移量，从栈中得到函数地址
     ci->func = restorestack(L, funcr);
+    // 与 Lua 函数的分支一样，base 指针指向 func+1 的地方
     L->base = ci->base = ci->func + 1;
     ci->top = L->top + LUA_MINSTACK;
     lua_assert(ci->top <= L->stack_last);
@@ -340,14 +352,19 @@ int luaD_precall (lua_State *L, StkId func, int nresults) {
     ci->nresults = nresults;
     if (L->hookmask & LUA_MASKCALL)
       luaD_callhook(L, LUA_HOOKCALL, -1);
+    // 由于进入到 C 的领域，需要把当前虚拟机的锁给解了
+    // (但其实这个版本的 Lua 里，lua_unlock 的实现是空的，只是作为一个魔改的入口，供用户自行按需实现)
     lua_unlock(L);
-    // 调用C函数
+    // 在此处完成了 C 函数的调用，参数为 L，返回值为 int
     n = (*curr_func(L)->c.f)(L);  /* do the actual call */
+    // 回到了 Lua 的领域，重新把锁取回
     lua_lock(L);
     if (n < 0)  /* yielding? */
       return PCRYIELD;
     else {
       // 调用结束之后的处理
+      // 对于 Lua 函数而言，这一步骤发生在 OP_RETURN 里
+      // 对于 C 函数而言，这一步骤（包括真正的函数调用）都发生在 luaD_precall 里，一次性都给完成了
       luaD_poscall(L, L->top - n);
       return PCRC;
     }
@@ -365,29 +382,34 @@ static StkId callrethooks (lua_State *L, StkId firstResult) {
   return restorestack(L, fr);
 }
 
-// 结束完一次函数调用(无论是C还是lua函数)的处理, firstResult是函数第一个返回值的地址
+// 结束完一次函数调用(无论是C还是lua函数)的处理,
+// firstResult 是函数第一个返回值的地址，会被依次赋值给当前函数在栈上的闭包所处位置及其后续位置（也就是 OP_CALL 的 ra）
+// 主要做的事情就是把 ci 回退到上一个的状态，并把当前函数的返回值依照规范放到栈上
 int luaD_poscall (lua_State *L, StkId firstResult) {
   StkId res;
   int wanted, i;
   CallInfo *ci;
   if (L->hookmask & LUA_MASKRET)
     firstResult = callrethooks(L, firstResult);
-  // 得到当时的CallInfo指针
+  // 得到当前的 CallInfo 指针，并自减 ci，回退到上一个 ci
   ci = L->ci--;
+  // res 用来放置第一个返回值，res+1 放置第二个返回值，以此类推
+  // 当前函数都已经结束了，其闭包也就已经没用了，那块寄存器也就被节省出来，放置返回值了
   res = ci->func;  /* res == final position of 1st result */
-  // 本来需要有多少返回值
+  // 预期需要多少个返回值
   wanted = ci->nresults;
-  // 把base和savepc指针置回调用前的位置
+  // 把 base 和 savep c指针恢复到调用当前函数之前的状态
   L->base = (ci - 1)->base;  /* restore base */
   L->savedpc = (ci - 1)->savedpc;  /* restore savedpc */
   /* move results to correct place */
   // 返回值压入栈中
   for (i = wanted; i != 0 && firstResult < L->top; i--)
     setobjs2s(L, res++, firstResult++);
-  // 剩余的返回值置nil
+  // 函数产生的返回值不足以填满预期需要的数量，剩余的位置置 nil
   while (i-- > 0)
     setnilvalue(res++);
-  // 可以将top指针置回调用之前的位置了
+  // 可以将 top 指针置回调用之前的位置了
+  // 注意到此时 top 指针指向的就是函数的首个返回值
   L->top = res;
   return (wanted - LUA_MULTRET);  /* 0 if wanted == LUA_MULTRET */
 }
