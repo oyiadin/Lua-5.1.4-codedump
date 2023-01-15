@@ -277,11 +277,16 @@ typedef struct LocVar {
 
 typedef struct UpVal {
   CommonHeader;
+  // 指向当前 upval 对应的值
+  // 如果当前 upval 还处于打开(open)状态，则指向的是栈上的值
+  // 如果当前 upval 已经被关闭了（如：外层函数已结束运行），则指向的是当前 upval 的 upval.u.value
   TValue *v;  /* points to stack or to its own value */
   union {
-	// 当这个upval被close时,保存upval的值,后面可能还会被引用到
+    // 当这个 upval 被关闭时，栈上的对应值将被拷贝到这里
+    // 函数结束后（这个 upval 将被关闭），这里的 value 将被拷贝为栈上对应值的副本，使其依靠这个副本秽土重生~
+    // 在外层函数结束后，所有里层函数对同一 upval 的修改也最终会统一反映在这个 value 之上
     TValue value;  /* the value (when closed) */
-    // 当这个upval还在open状态时,以下链表串连在openupval链表中
+    // 当这个 upval 还在 open 状态时，将借助这两个指针形成 openupval
     struct {  /* double linked list (when open) */
       struct UpVal *prev;
       struct UpVal *next;

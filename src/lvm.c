@@ -121,15 +121,16 @@ void luaV_gettable (lua_State *L, const TValue *t, TValue *key, StkId val) {
       }
       /* else will try the tag method */
     }
-    // 来查这个表的meta表, 如果不存在则报错
+    // 元表里是否存在 TM_INDEX，如果不存在，报错
     else if (ttisnil(tm = luaT_gettmbyobj(L, t, TM_INDEX)))
       luaG_typeerror(L, t, "index");
-    // 如果是一个函数则直接调用这个函数
+    // 如果元表里的 TM_INDEX 是一个函数，调用之
     if (ttisfunction(tm)) {
       callTMres(L, val, tm, t, key);
       return;
     }
-    // 否则继续找
+    // 否则继续往上层找
+    // 因此，元表的 TM_INDEX 可以是另外一个普通的 table，或者其他对象
     t = tm;  /* else repeat with `tm' */
   }
   luaG_runerror(L, "loop in gettable");
@@ -608,7 +609,7 @@ void luaV_execute (lua_State *L, int nexeccalls) {
       }
       case OP_CALL: {
         // 参数 B 的含义：
-        // =0: [ra, L->top) 的范围内都是参数
+        // =0: [ra+1, L->top) 的范围内都是参数
         // >0: (B-1) 为参数个数
         int b = GETARG_B(i);
         // 参数 C 的含义：
@@ -799,39 +800,52 @@ void luaV_execute (lua_State *L, int nexeccalls) {
         Proto *p;
         Closure *ncl;
         int nup, j;
-        // Bx中存放的是在上层函数proto数组中的索引
+        // cl 是当前函数的 closure
+        // Bx 是新函数在当前函数的 proto 数组里的下标
         p = cl->p->p[GETARG_Bx(i)];
+        // nups 在语法分析期间即已获得，upvals 的数量，被一并存放在 proto 里
         nup = p->nups;
+        // 创建一个新的 closure
         ncl = luaF_newLclosure(L, nup, cl->env);
         ncl->l.p = p;
-        // 紧跟着CLOSURE指令的是MOVE或者GETUPVAL指令
-        // 如果是GETUPVAL, 则从上层函数的upval中寻找upval
-        // 如果是MOVE, 则从
-        // 特别注意这里pc指针每次循环都递增了
+        // 紧接着 OP_CLOSURE 的必须是 nup 条 OP_GETUPVAL 或者 OP_MOVE 指令
+        // 注意每次循环都会自增 pc 吃掉下一条指令
         for (j=0; j<nup; j++, pc++) {
           if (GET_OPCODE(*pc) == OP_GETUPVAL)
+            // 如果是 OP_GETUPVAL（更上层函数的局部变量）
+            // 从当前函数的 upvals 中拷贝到新函数的 upvals 里
             ncl->l.upvals[j] = cl->upvals[GETARG_B(*pc)];
           else {
+            // 如果是 OP_MOVE（当前函数的局部变量）
+            // 从当前函数的局部变量转换为 UpVal，然后拷贝到新函数的 upvals 里
             lua_assert(GET_OPCODE(*pc) == OP_MOVE);
             ncl->l.upvals[j] = luaF_findupval(L, base + GETARG_B(*pc));
           }
         }
-        // 将创建好的closure存放到ra中
+        // 将新创建的 closure 存放到 ra 中
         setclvalue(L, ra, ncl);
         Protect(luaC_checkGC(L));
         continue;
       }
       case OP_VARARG: {
+        // b = B - 1 代表需要的参数数量
+        // B = 0 为特殊取值，代表无论传多少参数都全要了
         int b = GETARG_B(i) - 1;
         int j;
         CallInfo *ci = L->ci;
+        // n 是实际传入的参数数量
         int n = cast_int(ci->base - ci->func) - cl->p->numparams - 1;
         if (b == LUA_MULTRET) {
+          // 当 b == -1，也就是 B == 0 时
+          // 设置 b(需要的参数数量) = 传入的参数数量
+          // 并调整 L->top 指针，在后续 OP_CALL 可能会用到
           Protect(luaD_checkstack(L, n));
           ra = RA(i);  /* previous call may change the stack */
           b = n;
           L->top = ra + n;
         }
+        // 遍历，拷贝传入的参数到 ra + xxx 的地方
+        // 如果传入的参数数量小于需要的数量，补上 nil
         for (j = 0; j < b; j++) {
           if (j < n) {
             setobjs2s(L, ra + j, ci->base - n + j);

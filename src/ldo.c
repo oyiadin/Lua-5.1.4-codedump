@@ -398,7 +398,8 @@ int luaD_poscall (lua_State *L, StkId firstResult) {
   res = ci->func;  /* res == final position of 1st result */
   // 预期需要多少个返回值
   wanted = ci->nresults;
-  // 把 base 和 savep c指针恢复到调用当前函数之前的状态
+  // 把 base 和 savedpc 指针恢复到调用当前函数之前的状态
+  // 退出此函数之后，luaV_execute 将重新跳回 reentry，此时取到的指令就已经是“父函数”的了
   L->base = (ci - 1)->base;  /* restore base */
   L->savedpc = (ci - 1)->savedpc;  /* restore savedpc */
   /* move results to correct place */
